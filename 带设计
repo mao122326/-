@@ -1,0 +1,756 @@
+<div id="vb-design">
+  <style>
+    #vb-design .vb-field { flex: 1 1 10rem; min-width: 8rem; }
+    #vb-design .vb-head { display: flex; align-items: baseline; justify-content: flex-start; gap: .4rem; }
+    #vb-design .vb-chart { margin-top: .7rem; }
+    #vb-design svg { display: block; width: 100%; height: auto; }
+    #vb-design .vb-rows td { vertical-align: top; }
+    #vb-design .vb-rows { min-width: 30rem; }
+    #vb-design .vb-rows th { white-space: nowrap; }
+    #vb-design .vb-steps { margin: .4rem 0 0; padding-left: 1.4rem; }
+    #vb-design .vb-steps li { margin-bottom: .3rem; }
+    #vb-design h2 { margin: 1rem 0 0; }
+    #vb-design .vb-warn { margin: .5rem 0 0; }
+    #vb-design .vb-note { margin: .5rem 0 0; }
+    #vb-design .form-control, #vb-design .form-select, #vb-design .form-range { width: 100%; }
+  </style>
+
+  <div class="viz-controls" id="vb-inputs"></div>
+  <div class="viz-controls" id="vb-auto"></div>
+
+  <p class="text-small text-destructive vb-warn" id="vb-warn" role="alert" hidden></p>
+
+  <div class="vb-chart">
+    <svg id="vb-chart" role="img"
+      aria-label="普通V带选型图：横轴为小带轮转速，纵轴为计算功率，标出本次设计的工况点与推荐带型区">
+      <title>普通V带选型图与设计工况点</title>
+    </svg>
+  </div>
+
+  <div class="table-responsive">
+    <table class="table table-sm vb-rows">
+      <caption class="text-small text-muted">计算结果</caption>
+      <thead>
+        <tr><th scope="col">项目</th><th scope="col">结果</th><th scope="col">说明</th></tr>
+      </thead>
+      <tbody id="vb-rows"></tbody>
+    </table>
+  </div>
+
+  <h2>计算过程</h2>
+  <ol class="vb-steps" id="vb-steps"></ol>
+
+  <p class="text-small text-muted vb-note" id="vb-note"></p>
+
+  <script>
+  (function () {
+    'use strict';
+
+    var root = document.getElementById('vb-design');
+    if (!root) return;
+
+    var inputBox = document.getElementById('vb-inputs');
+    var autoBox = document.getElementById('vb-auto');
+    var warnEl = document.getElementById('vb-warn');
+    var rowsEl = document.getElementById('vb-rows');
+    var stepsEl = document.getElementById('vb-steps');
+    var noteEl = document.getElementById('vb-note');
+    var svg = document.getElementById('vb-chart');
+
+    var EPS_SLIP = 0.01;
+
+    /* 普通V带截面与轮槽参数（GB/T 13575.1） */
+    var BELT = {
+      Y: { bp: 5.3, b: 6, h: 4, dmin: 20, e: 8, f: 6, ha: 1.6, q: 0.02, cap: 0.25 },
+      Z: { bp: 8.5, b: 10, h: 6, dmin: 50, e: 12, f: 7, ha: 2.0, q: 0.06, cap: 0.58 },
+      A: { bp: 11, b: 13, h: 8, dmin: 75, e: 15, f: 9, ha: 2.75, q: 0.10, cap: 1 },
+      B: { bp: 14, b: 17, h: 11, dmin: 125, e: 19, f: 11.5, ha: 3.5, q: 0.17, cap: 1.75 },
+      C: { bp: 19, b: 22, h: 14, dmin: 200, e: 25.5, f: 16, ha: 4.8, q: 0.30, cap: 3.0 },
+      D: { bp: 27, b: 32, h: 19, dmin: 355, e: 37, f: 23, ha: 8.1, q: 0.62, cap: 5.8 },
+      E: { bp: 32, b: 38, h: 23, dmin: 500, e: 44.5, f: 28, ha: 9.6, q: 0.90, cap: 8.4 }
+    };
+    var ORDER = ['Y', 'Z', 'A', 'B', 'C', 'D', 'E'];
+
+    /* 基准直径系列（mm） */
+    var DD = [20, 22.4, 25, 28, 31.5, 35.5, 40, 45, 50, 56, 63, 71, 80, 90, 100, 112, 125,
+      140, 160, 180, 200, 224, 250, 280, 315, 355, 400, 450, 500, 560, 630, 710, 800, 900,
+      1000, 1120, 1250, 1400, 1600, 1800, 2000];
+
+    /* 基准长度系列（GB/T 11544，mm） */
+    var LD = [400, 450, 500, 560, 630, 710, 800, 900, 1000, 1120, 1250, 1400, 1600, 1800,
+      2000, 2240, 2500, 2800, 3150, 3550, 4000, 4500, 5000, 5600, 6300, 7100, 8000, 9000,
+      10000, 11200, 12500, 14000, 16000];
+
+    /* 工况系数 KA（原动机为交流电动机） */
+    var KA_TABLE = {
+      '平稳': [1.0, 1.1, 1.2],
+      '变动小': [1.1, 1.2, 1.3],
+      '变动较大': [1.2, 1.4, 1.5],
+      '变动很大': [1.5, 1.6, 1.8]
+    };
+    var HOUR_INDEX = { 'h10': 0, 'h16': 1, 'h24': 2 };
+    var HOUR_TEXT = { 'h10': '≤10 h', 'h16': '10~16 h', 'h24': '>16 h' };
+
+    /* 近似选型边界：各分界线上 n1 = 1000 r/min 处的计算功率（kW），斜率取 P ∝ n^0.5 */
+    var ZONE_EDGE = [0.15, 0.75, 5.5, 14, 40, 100];
+    var N_REF = 1000;
+    var KN = 0.5;
+
+    function edgePower(idx, n1) {
+      if (idx < 0) return 1e-6;
+      if (idx >= ZONE_EDGE.length) return 1e6;
+      return ZONE_EDGE[idx] * Math.pow(n1 / N_REF, KN);
+    }
+
+    function recommendType(pca, n1) {
+      for (var i = 0; i < ORDER.length; i++) {
+        if (pca <= edgePower(i, n1)) return ORDER[i];
+      }
+      return ORDER[ORDER.length - 1];
+    }
+
+    function nearest(list, target) {
+      var best = list[0], bd = Infinity;
+      for (var i = 0; i < list.length; i++) {
+        var d = Math.abs(list[i] - target);
+        if (d < bd) { bd = d; best = list[i]; }
+      }
+      return best;
+    }
+
+    function nearestUp(list, target) {
+      for (var i = 0; i < list.length; i++) if (list[i] >= target - 1e-9) return list[i];
+      return list[list.length - 1];
+    }
+
+    function seriesFor(type, forSmall) {
+      var dmin = BELT[type].dmin;
+      return DD.filter(function (v) {
+        if (v < dmin) return false;
+        if (forSmall && v > dmin * 6) return false;
+        return true;
+      });
+    }
+
+    /* ---------- state ---------- */
+    var MOTORS = [
+      { m: 'Y100L1-4', P: 2.2, n: 1420, D: 28, E: 60, kb: 8, kh: 7 },
+      { m: 'Y100L2-4', P: 3, n: 1420, D: 28, E: 60, kb: 8, kh: 7 },
+      { m: 'Y112M-4', P: 4, n: 1440, D: 28, E: 60, kb: 8, kh: 7 },
+      { m: 'Y132S-4', P: 5.5, n: 1440, D: 38, E: 80, kb: 10, kh: 8 },
+      { m: 'Y132M-4', P: 7.5, n: 1440, D: 38, E: 80, kb: 10, kh: 8 },
+      { m: 'Y160M-6', P: 7.5, n: 970, D: 42, E: 110, kb: 12, kh: 8 },
+      { m: 'Y160L-6', P: 11, n: 970, D: 42, E: 110, kb: 12, kh: 8 },
+      { m: 'Y160M-4', P: 11, n: 1460, D: 42, E: 110, kb: 12, kh: 8 },
+      { m: 'Y180L-6', P: 15, n: 970, D: 48, E: 110, kb: 14, kh: 9 },
+      { m: 'Y180L-4', P: 22, n: 1470, D: 48, E: 110, kb: 14, kh: 9 },
+      { m: 'Y200L-4', P: 30, n: 1470, D: 55, E: 110, kb: 16, kh: 10 }
+    ];
+    var MACHINES = [
+      { k: 'gen', name: '发电机', load: '平稳' },
+      { k: 'belt', name: '带式输送机', load: '平稳' },
+      { k: 'pump', name: '离心式水泵', load: '平稳' },
+      { k: 'fan', name: '通风机', load: '平稳' },
+      { k: 'mill', name: '金属切削机床', load: '变动小' },
+      { k: 'wood', name: '木工机床、锯木机', load: '变动较大' },
+      { k: 'comp', name: '压缩机、剪床', load: '变动较大' },
+      { k: 'crane', name: '起重机械', load: '变动很大' },
+      { k: 'crush', name: '破碎机、磨碎机', load: '变动很大' }
+    ];
+
+    var state = {
+      motor: 'Y160M-6', machine: 'wood',
+      P: 7.5, n1: 970, iReq: 3,
+      load: '变动较大', hours: 'h16', belt: 'auto'
+    };
+    var manual = {};
+
+    var BASIC = [
+      { k: 'P', label: '电机功率 P', unit: 'kW', min: 0.1, max: 500, step: 0.1 },
+      { k: 'n1', label: '小带轮转速 n1', unit: 'r/min', min: 100, max: 10000, step: 10 },
+      { k: 'iReq', label: '传动比 i', unit: '', min: 1, max: 12, step: 0.01 }
+    ];
+    var SELECTS = [
+      { k: 'motor', label: '电动机型号', kind: 'motor', opts: [] },
+      { k: 'machine', label: '工作机', kind: 'machine', opts: [] },
+      { k: 'load', label: '载荷性质', opts: [['平稳', '平稳'], ['变动小', '变动小'], ['变动较大', '变动较大'], ['变动很大', '变动很大']] },
+      { k: 'hours', label: '工作制度', opts: [['h10', '单班制（≤10 h）'], ['h16', '双班制（10~16 h）'], ['h24', '三班制（>16 h）']] },
+      { k: 'belt', label: '带型', opts: [['auto', '自动（按选型图）']].concat(ORDER.map(function (t) { return [t, t + ' 型']; })) }
+    ];
+    var ADJUST = [
+      { k: 'KA', label: '工况系数 KA', unit: '', min: 0.8, max: 3, step: 0.05 },
+      { k: 'a0', label: '初定中心距 a0', unit: 'mm', min: 50, max: 6000, step: 5 },
+      { k: 'P0', label: '单根带额定功率 P0', unit: 'kW', min: 0.01, max: 100, step: 0.01 },
+      { k: 'dP0', label: '功率增量 dP0', unit: 'kW', min: 0, max: 20, step: 0.01 },
+      { k: 'KL', label: '长度系数 KL', unit: '', min: 0.5, max: 1.6, step: 0.01 }
+    ];
+
+    var LREF = { Y: 630, Z: 1000, A: 1600, B: 2000, C: 3150, D: 4000, E: 5000 };
+
+    function lookupKA(load, hours) {
+      var row = KA_TABLE[load] || KA_TABLE['平稳'];
+      return row[HOUR_INDEX[hours] === undefined ? 1 : HOUR_INDEX[hours]];
+    }
+
+    function estP0(type, dd1, n1) {
+      return 1.264e-6 * BELT[type].cap * Math.pow(dd1, 1.6) * Math.pow(n1, 0.9);
+    }
+
+    function sizeOf(type, d1, d2, n1, iReq, Pca) {
+      var v = Math.PI * d1 * n1 / 60000;
+      var p0 = estP0(type, d1, n1);
+      var dP0 = p0 * 0.05 * Math.max(0, Math.min(iReq, 4) - 1);
+      var a0 = 1.35 * (d1 + d2);
+      var ld0 = 2 * a0 + Math.PI * (d1 + d2) / 2 + Math.pow(d2 - d1, 2) / (4 * a0);
+      var ld = nearest(LD, ld0);
+      var a = a0 + (ld - ld0) / 2;
+      var alpha = 180 - (d2 - d1) / a * 57.3;
+      var ka = 1.25 * (1 - Math.pow(5, -alpha / 180));
+      var kl = Math.pow(ld / LREF[type], 1 / 6);
+      return { v: v, z: Pca / ((p0 + dP0) * ka * kl), alpha: alpha };
+    }
+
+    function autoPick(type, n1, iReq, Pca) {
+      var opts = seriesFor(type, true);
+      var fallback = null;
+      var second = null;
+      for (var idx = 0; idx < opts.length; idx++) {
+        var d1 = opts[idx];
+        var d2 = nearest(opts.filter(function (v) { return v >= d1; }), iReq * d1);
+        var s = sizeOf(type, d1, d2, n1, iReq, Pca);
+        if (s.v < 5 || s.v > 25 || s.alpha < 120) continue;
+        var err = Math.abs(n1 * d1 * (1 - EPS_SLIP) / d2 - n1 / iReq) / (n1 / iReq) * 100;
+        if (s.z <= 4 && err <= 5) return { dd1: d1, dd2: d2 };
+        if (!second && s.z <= 6 && err <= 5) second = { dd1: d1, dd2: d2 };
+        if (!fallback || err < fallback.err) fallback = { dd1: d1, dd2: d2, err: err };
+      }
+      if (second) return second;
+      if (fallback) return fallback;
+      return { dd1: opts[0], dd2: nearest(opts, iReq * opts[0]) };
+    }
+
+    function compute() {
+      var KA = manual.KA ? state.KA : lookupKA(state.load, state.hours);
+      var Pca = KA * state.P;
+      var rec = recommendType(Pca, state.n1);
+      var type = state.belt === 'auto' ? rec : state.belt;
+      var t = BELT[type];
+
+      var opts1 = seriesFor(type, true);
+      var pick = autoPick(type, state.n1, state.iReq, Pca);
+      var dd1 = manual.dd1 ? nearest(opts1, state.dd1) : pick.dd1;
+      var opts2 = opts1.filter(function (v) { return v >= dd1; });
+      var dd2 = manual.dd2 ? nearest(opts2, state.dd2)
+        : (manual.dd1 ? nearest(opts2, state.iReq * dd1) : pick.dd2);
+
+      var v = Math.PI * dd1 * state.n1 / 60000;
+      var aMin = 0.7 * (dd1 + dd2), aMax = 2 * (dd1 + dd2);
+      var a0 = manual.a0 ? state.a0 : Math.round((aMin + aMax) / 2);
+      var Ld0 = 2 * a0 + Math.PI * (dd1 + dd2) / 2 + Math.pow(dd2 - dd1, 2) / (4 * a0);
+      var Ld = nearest(LD, Ld0);
+      var a = a0 + (Ld - Ld0) / 2;
+      var alpha = 180 - (dd2 - dd1) / a * 57.3;
+      var Kalpha = 1.25 * (1 - Math.pow(5, -alpha / 180));
+
+      var P0 = manual.P0 ? state.P0 : estP0(type, dd1, state.n1);
+      var dP0 = manual.dP0 ? state.dP0 : P0 * 0.05 * Math.max(0, Math.min(state.iReq, 4) - 1);
+      var KL = manual.KL ? state.KL : Math.pow(Ld / LREF[type], 1 / 6);
+      var zRaw = Pca / ((P0 + dP0) * Kalpha * KL);
+      var z = Math.max(1, Math.ceil(zRaw));
+      var F0 = 500 * (2.5 - Kalpha) * Pca / (Kalpha * z * v) + t.q * v * v;
+      var Fp = 2 * z * F0 * Math.sin(alpha / 2 * Math.PI / 180);
+      var B = (z - 1) * t.e + 2 * t.f;
+      var n2 = state.n1 * dd1 * (1 - EPS_SLIP) / dd2;
+      var n2t = state.n1 / state.iReq;
+      var err = Math.abs(n2 - n2t) / n2t * 100;
+      var iAct = dd2 / dd1;
+
+      var motor = null, machineName = '';
+      MOTORS.forEach(function (m) { if (m.m === state.motor) motor = m; });
+      MACHINES.forEach(function (m) { if (m.k === state.machine) machineName = m.name; });
+      var hubD = motor ? Math.round(1.9 * motor.D) : null;
+      var hubL = motor ? Math.round(1.8 * motor.D) : null;
+      var da1 = dd1 + 2 * t.ha, da2 = dd2 + 2 * t.ha;
+
+      var steps = [];
+      steps.push('工况系数：工作机为' + machineName + '（载荷' + state.load + '），' + HOUR_TEXT[state.hours] +
+        '，查工况系数表取 KA = ' + fmt(KA, 2) + '。');
+      steps.push('计算功率：Pca = KA·P = ' + fmt(KA, 2) + ' × ' + fmt(state.P, 2) + ' = ' + fmt(Pca, 2) + ' kW。');
+      steps.push('选择带型：由 Pca = ' + fmt(Pca, 2) + ' kW、n1 = ' + fmt(state.n1, 0) +
+        ' r/min 查选型图，选用 ' + type + ' 型（截面 bp×h = ' + t.bp + '×' + t.h +
+        ' mm，最小基准直径 ' + t.dmin + ' mm，单位长度质量 q = ' + t.q + ' kg/m）。');
+      steps.push('小带轮基准直径：取 dd1 = ' + fmt(dd1, 1) + ' mm，不小于 ' + t.dmin + ' mm。');
+      steps.push('大带轮基准直径：dd2 = i·dd1 = ' + fmt(state.iReq, 2) + ' × ' + fmt(dd1, 1) + ' = ' +
+        fmt(state.iReq * dd1, 1) + ' mm，按标准系列取 dd2 = ' + fmt(dd2, 1) + ' mm。');
+      steps.push('验算带速：v = π·dd1·n1/(60×1000) = π × ' + fmt(dd1, 1) + ' × ' + fmt(state.n1, 0) +
+        ' / 60000 = ' + fmt(v, 2) + ' m/s，在 5~25 m/s 范围内。');
+      steps.push('初定中心距：a0 = (0.7~2)(dd1+dd2) = ' + fmt(aMin, 0) + ' ~ ' + fmt(aMax, 0) +
+        ' mm，取 a0 = ' + fmt(a0, 0) + ' mm。');
+      steps.push('计算带长：Ld0 = 2a0 + (π/2)(dd1+dd2) + (dd2−dd1)²/(4a0) = 2×' + fmt(a0, 0) + ' + ' +
+        fmt(Math.PI * (dd1 + dd2) / 2, 1) + ' + ' + fmt(Math.pow(dd2 - dd1, 2) / (4 * a0), 1) +
+        ' = ' + fmt(Ld0, 1) + ' mm，取标准基准长度 Ld = ' + fmt(Ld, 0) + ' mm。');
+      steps.push('实际中心距：a ≈ a0 + (Ld − Ld0)/2 = ' + fmt(a0, 0) + ' + (' + fmt(Ld, 0) + ' − ' +
+        fmt(Ld0, 1) + ')/2 = ' + fmt(a, 1) + ' mm，中心距调整范围 ' + fmt(a - 0.015 * Ld, 1) + ' ~ ' +
+        fmt(a + 0.03 * Ld, 1) + ' mm。');
+      steps.push('验算包角：α1 = 180° − (dd2−dd1)/a × 57.3° = 180° − ' + fmt(dd2 - dd1, 1) + '/' +
+        fmt(a, 1) + ' × 57.3° = ' + fmt(alpha, 1) + '°，大于 120°，合格。');
+      steps.push('确定单根带功率：查表得 P0 = ' + fmt(P0, 2) + ' kW，功率增量 ΔP0 = ' + fmt(dP0, 2) + ' kW。');
+      steps.push('包角系数：Kα = 1.25(1 − 5^(−α1/180)) = 1.25 × (1 − 5^' + fmt(-alpha / 180, 3) + ') = ' +
+        fmt(Kalpha, 3) + '。');
+      steps.push('长度系数：按基准长度 Ld = ' + fmt(Ld, 0) + ' mm 取 KL = ' + fmt(KL, 3) + '。');
+      steps.push('确定根数：z = Pca/[(P0+ΔP0)·Kα·KL] = ' + fmt(Pca, 2) + '/[(' + fmt(P0, 2) + '+' +
+        fmt(dP0, 2) + ') × ' + fmt(Kalpha, 3) + ' × ' + fmt(KL, 3) + '] = ' + fmt(zRaw, 2) +
+        '，取 z = ' + z + ' 根。');
+      steps.push('单根带预紧力：F0 = 500(2.5 − Kα)Pca/(Kα·z·v) + qv² = 500 × ' + fmt(2.5 - Kalpha, 3) +
+        ' × ' + fmt(Pca, 2) + '/(' + fmt(Kalpha, 3) + ' × ' + z + ' × ' + fmt(v, 2) + ') + ' + t.q +
+        ' × ' + fmt(v * v, 2) + ' = ' + fmt(F0, 1) + ' N。');
+      steps.push('压轴力：Fp = 2zF0·sin(α1/2) = 2 × ' + z + ' × ' + fmt(F0, 1) + ' × sin(' +
+        fmt(alpha / 2, 1) + '°) = ' + fmt(Fp, 0) + ' N。');
+      steps.push('带轮宽度：B = (z−1)e + 2f = (' + z + '−1) × ' + t.e + ' + 2 × ' + t.f + ' = ' +
+        fmt(B, 1) + ' mm；外径 da1 = dd1 + 2ha = ' + fmt(da1, 1) + ' mm，da2 = ' + fmt(da2, 1) + ' mm。');
+      if (motor) {
+        steps.push('带轮轮毂与键：按电动机轴伸直径 d = ' + motor.D + ' mm，取轮毂直径 d1 = 1.9d = ' +
+          hubD + ' mm，轮毂长度 L = 1.8d = ' + hubL + ' mm，平键 b×h = ' + motor.kb + '×' + motor.kh +
+          ' mm，键长按轮毂长度取 ' + (hubL - 10) + ' mm 左右。');
+      }
+      steps.push('校核结果：带速 ' + fmt(v, 2) + ' m/s（5~25）、包角 ' + fmt(alpha, 1) +
+        '°（≥120°）、根数 ' + z + '（≤6）、输出转速偏差 ' + fmt(err, 2) + '%（≤5%）。');
+
+      return {
+        motor: motor, machineName: machineName, hubD: hubD, hubL: hubL, steps: steps,
+        KA: KA, Pca: Pca, rec: rec, type: type, t: t,
+        opts1: opts1, opts2: opts2,
+        dd1: dd1, dd2: dd2, iAct: iAct, n2: n2, n2t: n2t, err: err,
+        v: v, aMin: aMin, aMax: aMax, a0: a0, Ld0: Ld0, Ld: Ld, a: a,
+        alpha: alpha, Kalpha: Kalpha, P0: P0, dP0: dP0, KL: KL,
+        zRaw: zRaw, z: z, F0: F0, Fp: Fp, B: B,
+        da1: da1, da2: da2
+      };
+    }
+
+    /* ---------- theme colours ---------- */
+    var probe = document.createElement('div');
+    probe.style.cssText = 'position:absolute;left:-9999px;top:0;width:0;height:0;';
+    root.appendChild(probe);
+    var C = {};
+    function readColors() {
+      function get(name) {
+        probe.style.color = '';
+        probe.style.color = 'var(' + name + ')';
+        return getComputedStyle(probe).color || 'currentColor';
+      }
+      C = {
+        fg: get('--foreground'),
+        muted: get('--muted'),
+        mutedFg: get('--muted-foreground'),
+        border: get('--border'),
+        s1: get('--viz-series-1')
+      };
+    }
+
+    var NS = 'http://www.w3.org/2000/svg';
+    function sv(tag, attrs, text) {
+      var e = document.createElementNS(NS, tag);
+      if (attrs) {
+        for (var k in attrs) if (attrs[k] !== undefined && attrs[k] !== null) e.setAttribute(k, attrs[k]);
+      }
+      if (text !== undefined) e.textContent = text;
+      return e;
+    }
+
+    function fmt(x, n) {
+      if (!isFinite(x)) return '—';
+      return x.toFixed(n === undefined ? 2 : n);
+    }
+
+    /* ---------- selection chart ---------- */
+    var X0 = 100, X1 = 6000, Y0 = 0.05, Y1 = 600;
+    var M = { l: 56, r: 16, t: 28, b: 42 };
+
+    function drawChart(r) {
+      var w = svg.parentNode.clientWidth || 700;
+      var h = Math.round(Math.max(240, Math.min(340, w * 0.5)));
+      svg.setAttribute('viewBox', '0 0 ' + w + ' ' + h);
+      svg.setAttribute('aria-label',
+        '普通V带选型图：设计工况点 n1=' + fmt(r.n1 === undefined ? state.n1 : state.n1, 0) +
+        ' r/min，计算功率 Pca=' + fmt(r.Pca, 2) + ' kW，落在 ' + r.rec + ' 型区');
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+
+      var pl = w - M.l - M.r, pt = h - M.t - M.b;
+      var lx = function (n) { return M.l + Math.log(n / X0) / Math.log(X1 / X0) * pl; };
+      var ly = function (p) {
+        var q = Math.max(Y0, Math.min(Y1, p));
+        return M.t + (1 - Math.log(q / Y0) / Math.log(Y1 / Y0)) * pt;
+      };
+      var defs = sv('defs');
+      var clip = sv('clipPath', { id: 'vb-plot-clip' });
+      clip.appendChild(sv('rect', { x: M.l, y: M.t, width: pl, height: pt }));
+      defs.appendChild(clip);
+      svg.appendChild(defs);
+
+      svg.appendChild(sv('text', {
+        x: M.l, y: M.t - 10, fill: C.fg, 'font-size': 13
+      }, '普通V带选型图（近似边界）与设计工况点'));
+
+      var SAMPLES = 40, i, j, xv, up, lo;
+      function boundaryPath(idx) {
+        var d = '';
+        for (var s = 0; s <= SAMPLES; s++) {
+          xv = X0 * Math.pow(X1 / X0, s / SAMPLES);
+          up = edgePower(idx, xv);
+          d += (s ? ' L ' : 'M ') + lx(xv).toFixed(1) + ' ' + ly(up).toFixed(1);
+        }
+        return d;
+      }
+      for (i = 0; i < ZONE_EDGE.length; i++) {
+        svg.appendChild(sv('path', {
+          d: boundaryPath(i), fill: 'none', stroke: C.border, 'stroke-width': 1,
+          'clip-path': 'url(#vb-plot-clip)'
+        }));
+      }
+      var recIdx = ORDER.indexOf(r.rec);
+      if (recIdx >= 0) {
+        var pd = '';
+        for (var s1 = 0; s1 <= SAMPLES; s1++) {
+          xv = X0 * Math.pow(X1 / X0, s1 / SAMPLES);
+          up = edgePower(recIdx - 1, xv);
+          pd += (s1 ? ' L ' : 'M ') + lx(xv).toFixed(1) + ' ' + ly(up).toFixed(1);
+        }
+        for (var s2 = SAMPLES; s2 >= 0; s2--) {
+          xv = X0 * Math.pow(X1 / X0, s2 / SAMPLES);
+          lo = edgePower(recIdx, xv);
+          pd += ' L ' + lx(xv).toFixed(1) + ' ' + ly(lo).toFixed(1);
+        }
+        svg.appendChild(sv('path', {
+          d: pd + ' Z', fill: C.s1, 'fill-opacity': 0.16, stroke: 'none',
+          'clip-path': 'url(#vb-plot-clip)'
+        }));
+        svg.appendChild(sv('rect', {
+          x: M.l + 10, y: M.t + 10, width: 14, height: 10, fill: C.s1, 'fill-opacity': 0.35
+        }));
+        svg.appendChild(sv('text', {
+          x: M.l + 30, y: M.t + 19, fill: C.mutedFg, 'font-size': 12, 'text-anchor': 'start'
+        }, '推荐带型区 ' + r.rec));
+      }
+      for (j = 0; j < ORDER.length; j++) {
+        var mx = 900;
+        var lo2 = Math.max(edgePower(j - 1, mx), Y0);
+        var hi2 = Math.min(edgePower(j, mx), Y1);
+        var mp = Math.sqrt(lo2 * hi2);
+        if (mp < Y0 * 1.5 || mp > Y1 * 0.75) continue;
+        svg.appendChild(sv('text', {
+          x: lx(mx), y: ly(mp), fill: C.mutedFg, 'font-size': 12, 'text-anchor': 'middle'
+        }, ORDER[j]));
+      }
+
+      var tx = [100, 200, 500, 1000, 2000, 5000];
+      tx.forEach(function (n) {
+        svg.appendChild(sv('line', {
+          x1: lx(n), y1: M.t + pt, x2: lx(n), y2: M.t + pt + 4, stroke: C.border, 'stroke-width': 1
+        }));
+        svg.appendChild(sv('text', {
+          x: lx(n), y: M.t + pt + 17, fill: C.mutedFg, 'font-size': 11, 'text-anchor': 'middle'
+        }, String(n)));
+      });
+      var ty = [0.1, 1, 10, 100];
+      ty.forEach(function (p) {
+        svg.appendChild(sv('line', {
+          x1: M.l - 4, y1: ly(p), x2: M.l, y2: ly(p), stroke: C.border, 'stroke-width': 1
+        }));
+        svg.appendChild(sv('text', {
+          x: M.l - 7, y: ly(p) + 4, fill: C.mutedFg, 'font-size': 11, 'text-anchor': 'end'
+        }, String(p)));
+      });
+      svg.appendChild(sv('rect', {
+        x: M.l, y: M.t, width: pl, height: pt, fill: 'none', stroke: C.border, 'stroke-width': 1
+      }));
+      svg.appendChild(sv('text', {
+        x: M.l + pl / 2, y: h - 8, fill: C.mutedFg, 'font-size': 12, 'text-anchor': 'middle'
+      }, '小带轮转速 n1（r/min）'));
+      svg.appendChild(sv('text', {
+        x: 14, y: M.t + pt / 2, fill: C.mutedFg, 'font-size': 12, 'text-anchor': 'middle',
+        transform: 'rotate(-90 14 ' + (M.t + pt / 2) + ')'
+      }, '计算功率 Pca（kW）'));
+
+      var px = lx(state.n1), py = ly(r.Pca);
+      svg.appendChild(sv('line', {
+        x1: px, y1: M.t, x2: px, y2: M.t + pt, stroke: C.s1, 'stroke-width': 1, 'stroke-opacity': 0.5,
+        'clip-path': 'url(#vb-plot-clip)'
+      }));
+      svg.appendChild(sv('line', {
+        x1: M.l, y1: py, x2: M.l + pl, y2: py, stroke: C.s1, 'stroke-width': 1, 'stroke-opacity': 0.5,
+        'clip-path': 'url(#vb-plot-clip)'
+      }));
+      svg.appendChild(sv('circle', {
+        cx: px, cy: py, r: 6, fill: C.s1, stroke: C.muted, 'stroke-width': 2
+      }));
+      var anchor = px > M.l + pl - 150 ? 'end' : 'start';
+      svg.appendChild(sv('text', {
+        x: px + (anchor === 'end' ? -10 : 10), y: py - 10, fill: C.fg, 'font-size': 12,
+        'text-anchor': anchor
+      }, 'Pca = ' + fmt(r.Pca, 2) + ' kW'));
+    }
+
+    /* ---------- controls ---------- */
+    var ctl = {};
+
+    function field(label, node, unit) {
+      var f = document.createElement('div');
+      f.className = 'vb-field';
+      var head = document.createElement('div');
+      head.className = 'vb-head';
+      var lab = document.createElement('label');
+      lab.className = 'form-label';
+      lab.setAttribute('for', node.id);
+      lab.textContent = label + (unit ? '（' + unit + '）' : '');
+      head.appendChild(lab);
+      f.appendChild(head);
+      f.appendChild(node);
+      return f;
+    }
+
+    function onChange() {
+      refresh();
+    }
+
+    function buildUI() {
+      BASIC.forEach(function (d) {
+        var e = document.createElement('input');
+        e.type = 'number';
+        e.className = 'form-control';
+        e.id = 'vb-' + d.k;
+        e.min = d.min;
+        e.max = d.max;
+        e.step = d.step;
+        e.value = state[d.k];
+        e.addEventListener('input', function () {
+          state[d.k] = parseFloat(e.value);
+          if (d.k === 'P' || d.k === 'n1') {
+            var cur = null;
+            MOTORS.forEach(function (m) { if (m.m === state.motor) cur = m; });
+            if (cur && (cur.P !== state.P || cur.n !== state.n1)) {
+              state.motor = '';
+              if (ctl.motor) ctl.motor.value = '';
+            }
+          }
+          onChange();
+        });
+        ctl[d.k] = e;
+        inputBox.appendChild(field(d.label, e, d.unit));
+      });
+      SELECTS.forEach(function (d) {
+        var e = document.createElement('select');
+        e.className = 'form-select';
+        e.id = 'vb-' + d.k;
+        var opts = d.opts;
+        if (d.kind === 'motor') {
+          opts = [['', '自定义（手动输入功率与转速）']].concat(
+            MOTORS.map(function (m) { return [m.m, m.m + '（' + m.P + ' kW / ' + m.n + ' r/min）']; }));
+        } else if (d.kind === 'machine') {
+          opts = MACHINES.map(function (m) { return [m.k, m.name]; });
+        }
+        opts.forEach(function (o) {
+          var op = document.createElement('option');
+          op.value = o[0];
+          op.textContent = o[1];
+          e.appendChild(op);
+        });
+        e.value = state[d.k];
+        e.addEventListener('change', function () {
+          state[d.k] = e.value;
+          if (d.kind === 'motor') {
+            var mo = null;
+            MOTORS.forEach(function (m) { if (m.m === e.value) mo = m; });
+            if (mo) {
+              state.P = mo.P;
+              state.n1 = mo.n;
+              if (ctl.P) ctl.P.value = String(mo.P);
+              if (ctl.n1) ctl.n1.value = String(mo.n);
+            }
+          } else if (d.kind === 'machine') {
+            MACHINES.forEach(function (m) { if (m.k === e.value) state.load = m.load; });
+            if (ctl.load) ctl.load.value = state.load;
+          }
+          onChange();
+        });
+        ctl[d.k] = e;
+        inputBox.appendChild(field(d.label, e, ''));
+      });
+      ['dd1', 'dd2'].forEach(function (k) {
+        var e = document.createElement('select');
+        e.className = 'form-select';
+        e.id = 'vb-' + k;
+        e.addEventListener('change', function () {
+          manual[k] = true;
+          state[k] = parseFloat(e.value);
+          onChange();
+        });
+        ctl[k] = e;
+        autoBox.appendChild(field(k === 'dd1' ? '小带轮基准直径 dd1' : '大带轮基准直径 dd2', e, 'mm'));
+      });
+      ADJUST.forEach(function (d) {
+        var e = document.createElement('input');
+        e.type = 'number';
+        e.className = 'form-control';
+        e.id = 'vb-' + d.k;
+        e.min = d.min;
+        e.max = d.max;
+        e.step = d.step;
+        e.addEventListener('input', function () {
+          manual[d.k] = true;
+          state[d.k] = parseFloat(e.value);
+          onChange();
+        });
+        ctl[d.k] = e;
+        autoBox.appendChild(field(d.label, e, d.unit));
+      });
+    }
+
+    function setVal(k, v, decimals) {
+      var e = ctl[k];
+      if (!e || document.activeElement === e) return;
+      var txt = decimals === undefined ? String(v) : v.toFixed(decimals);
+      if (e.value !== txt) e.value = txt;
+    }
+
+    function syncControls(r) {
+      setVal('KA', r.KA, 2);
+      setVal('a0', Math.round(r.a0), 0);
+      setVal('P0', r.P0, 2);
+      setVal('dP0', r.dP0, 2);
+      setVal('KL', r.KL, 2);
+      ['dd1', 'dd2'].forEach(function (k) {
+        var e = ctl[k];
+        var opts = k === 'dd1' ? r.opts1 : r.opts2;
+        var want = opts.join(',');
+        if (e.dataset.opts !== want) {
+          e.textContent = '';
+          opts.forEach(function (v) {
+            var o = document.createElement('option');
+            o.value = v;
+            o.textContent = String(v);
+            e.appendChild(o);
+          });
+          e.dataset.opts = want;
+        }
+        e.value = String(k === 'dd1' ? r.dd1 : r.dd2);
+      });
+    }
+
+    /* ---------- result table ---------- */
+    function row(label, value, note, bad) {
+      var tr = document.createElement('tr');
+      var th = document.createElement('th');
+      th.setAttribute('scope', 'row');
+      th.textContent = label;
+      var td = document.createElement('td');
+      td.className = 'text-nowrap tabular-nums';
+      if (bad) td.classList.add('text-destructive');
+      td.textContent = value;
+      var nt = document.createElement('td');
+      nt.className = 'text-small text-muted';
+      nt.textContent = note || '';
+      tr.appendChild(th);
+      tr.appendChild(td);
+      tr.appendChild(nt);
+      return tr;
+    }
+
+    function render(r) {
+      rowsEl.textContent = '';
+      var vOk = r.v >= 5 && r.v <= 25;
+      var aOk = r.alpha >= 120;
+      var zOk = r.z <= 6;
+      var eOk = r.err <= 5;
+      var bad = [];
+      if (!vOk) bad.push('带速 v = ' + fmt(r.v, 2) + ' m/s 不在 5~25 m/s 内，宜调整 dd1');
+      if (!aOk) bad.push('小轮包角 α1 = ' + fmt(r.alpha, 1) + '° 小于 120°，应加大中心距或缩小两轮直径差');
+      if (!zOk) bad.push('所需根数 z = ' + r.z + ' 偏多（一般不超过 6 根），宜加大带轮直径或改用大一号带型');
+      if (!eOk) bad.push('输出转速偏差 ' + fmt(r.err, 1) + '% 超过 5%，需调整 dd2');
+      warnEl.hidden = bad.length === 0;
+      warnEl.textContent = bad.join('；');
+
+      rowsEl.appendChild(row('电动机', state.motor, '额定功率 ' + fmt(state.P, 2) + ' kW，满载转速 ' +
+        fmt(state.n1, 0) + ' r/min' + (r.motor ? '，轴伸 D×E = ' + r.motor.D + '×' + r.motor.E + ' mm' : '')));
+      rowsEl.appendChild(row('工作机', r.machineName + '，传动比 i = ' + fmt(state.iReq, 2) + '，' + HOUR_TEXT[state.hours],
+        '按载荷性质与工作制度取工况系数'));
+      rowsEl.appendChild(row('工况系数 KA', fmt(r.KA, 2),
+        '载荷' + state.load + ' · ' + HOUR_TEXT[state.hours] + '，原动机按交流电动机'));
+      rowsEl.appendChild(row('计算功率 Pca', fmt(r.Pca, 2) + ' kW', 'Pca = KA·P'));
+      rowsEl.appendChild(row('推荐带型', r.rec + ' 型',
+        state.belt === 'auto' ? '按选型图自动选取' : '当前指定 ' + r.type + ' 型，选型图推荐 ' + r.rec + ' 型'));
+      rowsEl.appendChild(row('带型截面', 'bp×h = ' + r.t.bp + '×' + r.t.h + ' mm',
+        '单位长度质量 q = ' + r.t.q + ' kg/m，最小基准直径 ' + r.t.dmin + ' mm'));
+      rowsEl.appendChild(row('小带轮基准直径 dd1', fmt(r.dd1, 1) + ' mm', '标准系列取值'));
+      rowsEl.appendChild(row('大带轮基准直径 dd2', fmt(r.dd2, 1) + ' mm',
+        'i·dd1 = ' + fmt(state.iReq * r.dd1, 1) + ' mm，取标准值'));
+      rowsEl.appendChild(row('实际传动比', fmt(r.iAct, 3), '按 dd2/dd1 计算'));
+      rowsEl.appendChild(row('大带轮转速 n2', fmt(r.n2, 1) + ' r/min',
+        '目标 ' + fmt(r.n2t, 1) + ' r/min，偏差 ' + fmt(r.err, 2) + '%（滑动率 ' + (EPS_SLIP * 100) + '%）', !eOk));
+      rowsEl.appendChild(row('带速 v', fmt(r.v, 2) + ' m/s', '许用 5~25 m/s，常用 10~20 m/s', !vOk));
+      rowsEl.appendChild(row('初定中心距 a0', fmt(r.a0, 0) + ' mm',
+        '建议范围 ' + fmt(r.aMin, 0) + ' ~ ' + fmt(r.aMax, 0) + ' mm'));
+      rowsEl.appendChild(row('计算带长 Ld0', fmt(r.Ld0, 1) + ' mm', 'Ld0 = 2a0 + (π/2)(dd1+dd2) + (dd2−dd1)²/(4a0)'));
+      rowsEl.appendChild(row('基准长度 Ld', fmt(r.Ld, 0) + ' mm', '取标准基准长度'));
+      rowsEl.appendChild(row('实际中心距 a', fmt(r.a, 1) + ' mm',
+        '调整范围 ' + fmt(r.a - 0.015 * r.Ld, 1) + ' ~ ' + fmt(r.a + 0.03 * r.Ld, 1) + ' mm'));
+      rowsEl.appendChild(row('小轮包角 α1', fmt(r.alpha, 1) + '°', '要求 ≥ 120°', !aOk));
+      rowsEl.appendChild(row('单根带额定功率 P0', fmt(r.P0, 2) + ' kW',
+        manual.P0 ? '手动输入的查表值' : '按经验式估算，请按 GB/T 13575.1 查表核对'));
+      rowsEl.appendChild(row('功率增量 ΔP0', fmt(r.dP0, 2) + ' kW',
+        manual.dP0 ? '手动输入' : '按传动比估算'));
+      rowsEl.appendChild(row('包角系数 Kα', fmt(r.Kalpha, 3), 'Kα = 1.25(1 − 5^(−α1/180))'));
+      rowsEl.appendChild(row('长度系数 KL', fmt(r.KL, 3),
+        manual.KL ? '手动输入' : '按 Ld 估算，请查表核对'));
+      rowsEl.appendChild(row('所需带根数 z', r.z + ' 根',
+        '计算值 ' + fmt(r.zRaw, 2) + '，向上取整', !zOk));
+      rowsEl.appendChild(row('单根带预紧力 F0', fmt(r.F0, 0) + ' N', 'F0 = 500(2.5 − Kα)Pca/(Kα·z·v) + qv²'));
+      rowsEl.appendChild(row('压轴力 Fp', fmt(r.Fp, 0) + ' N', 'Fp ≈ 2zF0·sin(α1/2)'));
+      rowsEl.appendChild(row('带轮宽度 B', fmt(r.B, 1) + ' mm', 'B = (z−1)e + 2f，e = ' + r.t.e + '，f = ' + r.t.f));
+      rowsEl.appendChild(row('带轮外径 da1 / da2', fmt(r.da1, 1) + ' / ' + fmt(r.da2, 1) + ' mm', '参考值 dd + 2ha'));
+      if (r.motor) {
+        rowsEl.appendChild(row('小带轮轮毂 d1 × L', r.hubD + ' × ' + r.hubL + ' mm',
+          '按电动机轴伸 d = ' + r.motor.D + ' mm 取 d1 = 1.9d，L = 1.8d'));
+        rowsEl.appendChild(row('平键 b×h×l', r.motor.kb + '×' + r.motor.kh + '×' + (r.hubL - 10) + ' mm',
+          '按轴径 ' + r.motor.D + ' mm 选键，键长取略小于轮毂长度'));
+      }
+      stepsEl.textContent = '';
+      r.steps.forEach(function (s) {
+        var li = document.createElement('li');
+        li.textContent = s;
+        stepsEl.appendChild(li);
+      });
+    }
+
+    function refresh() {
+      var r = compute();
+      syncControls(r);
+      render(r);
+      drawChart(r);
+    }
+
+    readColors();
+    buildUI();
+    noteEl.textContent = '选型图边界为近似值；单根带额定功率 P0、功率增量 ΔP0 与长度系数 KL 的自动值为估算值，' +
+      '正式设计请按 GB/T 13575.1 查表后覆盖输入（ΔP0 按带型、传动比与转速取值），其余结果会自动跟着更新。';
+    refresh();
+
+    if (window.ResizeObserver) {
+      new ResizeObserver(function () { drawChart(compute()); }).observe(svg.parentNode);
+    } else {
+      window.addEventListener('resize', function () { drawChart(compute()); });
+    }
+    var mo = new MutationObserver(function () {
+      readColors();
+      drawChart(compute());
+    });
+    mo.observe(document.documentElement, { attributes: true, attributeFilter: ['class', 'style', 'data-theme'] });
+    if (window.matchMedia) {
+      var mq = window.matchMedia('(prefers-color-scheme: dark)');
+      var onScheme = function () { readColors(); drawChart(compute()); };
+      if (mq.addEventListener) mq.addEventListener('change', onScheme);
+      else if (mq.addListener) mq.addListener(onScheme);
+    }
+  })();
+  </script>
+</div>
